@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 
 # dspm-upload-to-s3.sh - Upload DSPM data files to S3 and optionally make public
+# Updated to use bucket policies instead of ACLs for public access
 
 set -euo pipefail
 
@@ -10,7 +11,7 @@ function usage() {
   echo "Options:"
   echo "  --bucket    Name of the S3 bucket to upload to"
   echo "  --dir       Directory of files to upload (default: ./dspm_test_data)"
-  echo "  --public    Make uploaded files public"
+  echo "  --public    Make uploaded files public (uses bucket policy)"
   exit 1
 }
 
@@ -18,6 +19,8 @@ function usage() {
 BUCKET_NAME=""
 UPLOAD_DIR="./dspm_test_data"
 MAKE_PUBLIC=false
+AWS_REGION=${AWS_DEFAULT_REGION:-$(aws configure get region)}
+AWS_REGION=${AWS_REGION:-us-east-1}
 
 # Parse args
 while [[ $# -gt 0 ]]; do
@@ -57,25 +60,80 @@ if [[ ! -d "$UPLOAD_DIR" ]]; then
   exit 1
 fi
 
-# Create the bucket if it doesn't exist
+# Check if bucket exists
+BUCKET_EXISTS=true
 if ! aws s3 ls "s3://$BUCKET_NAME" &>/dev/null; then
-  echo "ℹ️  Bucket does not exist. Creating '$BUCKET_NAME'..."
-  aws s3 mb "s3://$BUCKET_NAME"
+  BUCKET_EXISTS=false
+  echo "ℹ️  Bucket does not exist. Creating '$BUCKET_NAME' in region $AWS_REGION..."
+  aws s3 mb "s3://$BUCKET_NAME" --region "$AWS_REGION"
+fi
+
+# Configure public access if requested
+if $MAKE_PUBLIC; then
+  if ! $BUCKET_EXISTS; then
+    echo "ℹ️  Configuring new bucket for public access..."
+    
+    # Disable public access block
+    aws s3api put-public-access-block \
+      --bucket "$BUCKET_NAME" \
+      --public-access-block-configuration "BlockPublicAcls=false,IgnorePublicAcls=false,BlockPublicPolicy=false,RestrictPublicBuckets=false"
+    
+    # Set ownership controls
+    aws s3api put-bucket-ownership-controls \
+      --bucket "$BUCKET_NAME" \
+      --ownership-controls 'Rules=[{ObjectOwnership="ObjectWriter"}]'
+  fi
+
+  # Apply public read bucket policy
+  POLICY_TEMPLATE='{
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "PublicReadGetObject",
+        "Effect": "Allow",
+        "Principal": "*",
+        "Action": "s3:GetObject",
+        "Resource": "arn:aws:s3:::%s/*"
+      }
+    ]
+  }'
+  printf -v POLICY "$POLICY_TEMPLATE" "$BUCKET_NAME"
+  
+  echo "ℹ️  Applying public read bucket policy..."
+  aws s3api put-bucket-policy --bucket "$BUCKET_NAME" --policy "$POLICY"
 fi
 
 # Upload files with timestamped prefix
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+UPLOAD_ERROR=0
+
 for file in "$UPLOAD_DIR"/*; do
+  [[ -e "$file" ]] || continue  # Handle case with no files
+  
   base_file=$(basename "$file")
   s3_path="s3://$BUCKET_NAME/dspm/$TIMESTAMP/$base_file"
+  
   echo "⬆️  Uploading $base_file to $s3_path"
-  aws s3 cp "$file" "$s3_path"
-
-  if $MAKE_PUBLIC; then
-    echo "🌍 Making $s3_path public"
-    aws s3api put-object-acl --bucket "$BUCKET_NAME" --key "dspm/$TIMESTAMP/$base_file" --acl public-read
-    echo "🔗 Public URL: https://$BUCKET_NAME.s3.amazonaws.com/dspm/$TIMESTAMP/$base_file"
+  
+  # Upload without ACL
+  if aws s3 cp "$file" "$s3_path"; then
+    if $MAKE_PUBLIC; then
+      echo "🌍 Public URL: https://$BUCKET_NAME.s3.$AWS_REGION.amazonaws.com/dspm/$TIMESTAMP/$base_file"
+    fi
+  else
+    echo "❌ Failed to upload $base_file" >&2
+    UPLOAD_ERROR=1
   fi
 done
 
-echo "✅ Upload complete."
+if [[ $UPLOAD_ERROR -eq 0 ]]; then
+  echo "✅ Upload complete."
+  
+  if $MAKE_PUBLIC; then
+    echo "ℹ️  IMPORTANT: Files are publicly accessible via the URLs above"
+    echo "   Use caution with sensitive data. Disable public access when done."
+  fi
+else
+  echo "❌ Some files failed to upload. See errors above." >&2
+  exit 1
+fi
