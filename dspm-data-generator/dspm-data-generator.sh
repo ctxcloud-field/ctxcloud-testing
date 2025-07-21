@@ -12,6 +12,8 @@ DEFAULT_RECORDS=100  # Changed from 1000 to 100
 AWS_UPLOAD=false
 S3_BUCKET=""
 MAKE_PUBLIC=false
+AWS_REGION=${AWS_DEFAULT_REGION:-$(aws configure get region 2>/dev/null)}
+AWS_REGION=${AWS_REGION:-us-east-1}
 
 # Colors for output
 RED='\033[0;31m'
@@ -515,23 +517,20 @@ create_s3_bucket() {
         return 0
     fi
     
-    # Get AWS region
-    local region=$(aws configure get region 2>/dev/null || echo "us-east-1")
-    
     # Create bucket with appropriate location constraint
-    if [[ "$region" == "us-east-1" ]]; then
+    if [[ "$AWS_REGION" == "us-east-1" ]]; then
         # us-east-1 doesn't need location constraint
-        if aws s3api create-bucket --bucket "$bucket_name" --region "$region" >/dev/null 2>&1; then
-            print_status "Successfully created bucket: $bucket_name in region: $region"
+        if aws s3api create-bucket --bucket "$bucket_name" --region "$AWS_REGION" >/dev/null 2>&1; then
+            print_status "Successfully created bucket: $bucket_name in region: $AWS_REGION"
         else
             print_error "Failed to create bucket: $bucket_name"
             return 1
         fi
     else
         # Other regions need location constraint
-        if aws s3api create-bucket --bucket "$bucket_name" --region "$region" \
-            --create-bucket-configuration LocationConstraint="$region" >/dev/null 2>&1; then
-            print_status "Successfully created bucket: $bucket_name in region: $region"
+        if aws s3api create-bucket --bucket "$bucket_name" --region "$AWS_REGION" \
+            --create-bucket-configuration LocationConstraint="$AWS_REGION" >/dev/null 2>&1; then
+            print_status "Successfully created bucket: $bucket_name in region: $AWS_REGION"
         else
             print_error "Failed to create bucket: $bucket_name"
             return 1
@@ -570,6 +569,12 @@ configure_public_access() {
     # Remove public access block
     aws s3api delete-public-access-block --bucket "$bucket_name" >/dev/null 2>&1 || print_warning "Could not remove public access block"
     
+    # Set ownership controls to ObjectWriter (disables ACLs)
+    aws s3api put-bucket-ownership-controls \
+        --bucket "$bucket_name" \
+        --ownership-controls 'Rules=[{ObjectOwnership="ObjectWriter"}]' \
+        >/dev/null 2>&1 || print_warning "Could not set ownership controls"
+    
     # Create public read policy
     local public_policy=$(cat << EOF
 {
@@ -590,7 +595,7 @@ EOF
     # Apply public read policy
     if echo "$public_policy" | aws s3api put-bucket-policy --bucket "$bucket_name" --policy file:///dev/stdin >/dev/null 2>&1; then
         print_warning "Bucket configured for public read access"
-        print_warning "Files will be accessible at: https://$bucket_name.s3.amazonaws.com/"
+        print_warning "Files will be accessible at: https://$bucket_name.s3.$AWS_REGION.amazonaws.com/"
     else
         print_error "Failed to apply public read policy"
         return 1
@@ -625,20 +630,14 @@ upload_to_s3() {
     local timestamp=$(date +%Y/%m/%d/%H%M%S)
     local s3_prefix="dspm-test-data/$timestamp"
     
-    # Upload all files in the directory
-    local upload_cmd="aws s3 cp \"$local_dir\" \"s3://$bucket_name/$s3_prefix/\" --recursive --quiet"
-    
-    if [[ "$make_public" == "true" ]]; then
-        upload_cmd="$upload_cmd --acl public-read"
-        print_warning "Uploading files with public-read ACL!"
-    fi
-    
-    if eval "$upload_cmd"; then
+    # Upload all files in the directory (without ACLs)
+    if aws s3 cp "$local_dir" "s3://$bucket_name/$s3_prefix/" --recursive --quiet; then
         print_status "Successfully uploaded files to s3://$bucket_name/$s3_prefix/"
         echo ""
         echo -e "${BLUE}S3 Upload Summary:${NC}"
         echo "Bucket: $bucket_name"
         echo "Path: s3://$bucket_name/$s3_prefix/"
+        echo "Region: $AWS_REGION"
         
         if [[ "$make_public" == "true" ]]; then
             echo -e "${YELLOW}Public Access: YES - Files are publicly accessible!${NC}"
@@ -646,7 +645,7 @@ upload_to_s3() {
             for file in "$local_dir"/*; do
                 if [[ -f "$file" ]]; then
                     filename=$(basename "$file")
-                    echo "  https://$bucket_name.s3.amazonaws.com/$s3_prefix/$filename"
+                    echo "  https://$bucket_name.s3.$AWS_REGION.amazonaws.com/$s3_prefix/$filename"
                 fi
             done
         else

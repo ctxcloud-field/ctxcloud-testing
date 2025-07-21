@@ -42,7 +42,7 @@ Based on MicroK8s and community-sourced YAMLs, we’ll deploy:
 - An XMRig cryptominer as a DaemonSet
 - A persistence mechanism via CronJob
 
-These tests follow Cortex XSIAM/Prisma CDR research and highlight:
+These tests follow Cortex XSIAM/Cloud CDR research and highlight:
 - Privileged access
 - Persistence techniques
 - Suspicious DNS, command, and system behavior
